@@ -26,11 +26,11 @@ The check stands aside, loudly, when it cannot measure at all: a 404 on the prob
 
 | | |
 |---|---|
-| **Yes** | lint, typecheck, unit tests, dbt, scheduled internal jobs |
-| **No** | container builds — image layers and Trivy's database fill a 100 GB disk in days |
+| **Yes** | lint, typecheck, unit tests, dbt, scheduled internal jobs, a pull request's image checks (`container-ci` lint and amd64 build-scan) |
+| **No** | publishing an image, an arm64 build, any job handed a credential |
 | **Never** | anything triggered by a public repository |
 
-Container jobs stay on GitHub-hosted until there is a runner with disk sized for them. That is a capacity decision, not a security one.
+Image checks need Docker and their own disk; see [Docker for image checks](#docker-for-image-checks). Publishing stays on GitHub-hosted for a security reason, not a capacity one: what ships is built on a machine no pull request has run on.
 
 ## Standing one up
 
@@ -259,6 +259,101 @@ repository, repeats it every day until the runners are back.
 
 This is the most common way a self-hosted runner dies. It is a timer from day one, not a thing to add after the first outage.
 
+## Docker for image checks
+
+`container-ci` with `runner-label` builds and scans images here. Four
+decisions, each of which has an obvious alternative that is wrong.
+
+**Rootless, never the `docker` group.** A member of that group can start a
+container that mounts `/` and so is root on the machine — for every job, from
+every pull request. Docker runs rootless as the `runner` user instead: one
+daemon under `runner`'s own systemd, which a job reaches through
+`DOCKER_HOST` and which can do nothing `runner` cannot. The root daemon is
+installed, because the rootless one is built from it, and disabled.
+
+**Its own disk.** Image layers, build cache and Trivy's database are tens of
+gigabytes; on the root disk they would reach the 85% tier of `reclaim-disk`
+within days, and a full root disk stops every runner, not only the image
+jobs. The daemon's `data-root` is a second virtual disk mounted with `nofail`,
+so a missing disk costs the image jobs and boots the rest. `reclaim-disk`
+measures `/` only; this disk is kept in check by its own two limits: BuildKit's
+garbage collection (`defaultKeepStorage`) and a daily `docker system prune`
+of anything over a day old, a user timer of `runner`'s.
+
+**The containerd image store.** The self-hosted leg builds with the daemon's
+own builder, not the docker-container builder GitHub-hosted legs use — that
+one runs a privileged BuildKit container, which rootless Docker cannot fully
+grant. The daemon's builder writes the OCI archive the scan reads only with the
+containerd image store, the default for a new Docker 29 install.
+
+**The socket is visible to jobs, read-only.** The runner unit's
+`ProtectHome=true` hides `/run/user`, where the rootless socket lives. A
+drop-in relaxes it to `read-only`: jobs can reach the socket and cannot write
+anywhere under `/home`, `/root` or `/run/user`, and other users' home
+directories stay closed by their own permissions.
+
+Setup, as root, on Ubuntu 24.04 with the second disk attached:
+
+```bash
+# The disk -- by its stable id, not /dev/sdX.
+mkfs.ext4 -L docker /dev/disk/by-id/<the new disk>
+mkdir -p /srv/docker
+echo 'LABEL=docker /srv/docker ext4 defaults,noatime,nofail 0 2' >> /etc/fstab
+mount /srv/docker && chown runner:runner /srv/docker
+
+# Docker from Docker's own repository, then the root daemon off for good.
+apt-get install -y docker-ce docker-ce-cli docker-ce-rootless-extras \
+  docker-buildx-plugin uidmap slirp4netns dbus-user-session
+systemctl disable --now docker.service docker.socket containerd.service
+rm -f /var/run/docker.sock
+
+# Ubuntu 24.04 restricts unprivileged user namespaces; rootlesskit needs one.
+cat > /etc/apparmor.d/usr.bin.rootlesskit <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+/usr/bin/rootlesskit flags=(unconfined) {
+  userns,
+
+  include if exists <local/usr.bin.rootlesskit>
+}
+EOF
+systemctl restart apparmor.service
+
+# runner's daemon: alive with nobody logged in, data on the disk above.
+loginctl enable-linger runner
+uid=$(id -u runner); home=$(getent passwd runner | cut -d: -f6)
+sudo -u runner mkdir -p "$home/.config/docker"
+echo '{"data-root": "/srv/docker/data", "builder": {"gc": {"enabled": true, "defaultKeepStorage": "40GB"}}}' \
+  | sudo -u runner tee "$home/.config/docker/daemon.json"
+sudo -u runner -H env XDG_RUNTIME_DIR=/run/user/$uid \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus \
+  dockerd-rootless-setuptool.sh install
+
+# Jobs find it; the runners pick this up when they restart.
+mkdir -p /etc/systemd/system/actions-runner@.service.d
+printf '[Service]\nEnvironment=DOCKER_HOST=unix:///run/user/%s/docker.sock\nProtectHome=read-only\n' "$uid" \
+  > /etc/systemd/system/actions-runner@.service.d/docker.conf
+systemctl daemon-reload
+```
+
+The daily prune is a `docker-prune.service` and `.timer` pair under
+`$home/.config/systemd/user/`, running
+`docker system prune -af --filter until=24h` with the same `DOCKER_HOST`,
+enabled with `systemctl --user enable --now docker-prune.timer` as `runner`.
+
+To check it the way a job will see it, under the runner unit's own sandbox:
+
+```bash
+systemd-run --uid=runner --wait --pipe -p ProtectSystem=strict \
+  -p ProtectHome=read-only -p PrivateTmp=true -p NoNewPrivileges=true \
+  -E HOME=/tmp -E DOCKER_HOST=unix:///run/user/$uid/docker.sock \
+  sh -c 'printf "FROM alpine:3.22\nRUN true\n" | docker buildx build --provenance=false --sbom=false --output type=oci,dest=/tmp/t.tar - && tar -tf /tmp/t.tar | head -3'
+```
+
+It lists `blobs/`, `index.json` and `oci-layout` when the runner can do what
+`build-scan` does.
+
 ## Network egress — the control that decides the blast radius
 
 **This is not in any script, and everything above assumes it exists.**
@@ -356,10 +451,17 @@ twenty-four hours before cancelling it. So opting in has to be an act, taken
 in a repo the runner group actually grants, not something a version bump does
 to thirty repos at once.
 
-`dbt-ci` and `container-ci` do not take the input at all. Both hand a job a
-warehouse or registry credential, and a stage-1 VM on the office LAN is not
-where those go. Neither does the `violation` job in `security-baseline`, for
-the same reason — it holds the App key that files the issue.
+`dbt-ci` does not take the input at all: it hands its job a warehouse
+credential, and a stage-1 VM on the office LAN is not where that goes. Neither
+does the `violation` job in `security-baseline`, for the same reason — it
+holds the App key that files the issue.
+
+`container-ci` takes it for its two jobs that hold no credential, `lint` and
+the amd64 `build-scan` leg. `publish`, which signs in to the registries, never
+moves, and a run with `publish: true` keeps every job on GitHub-hosted runners
+whatever the input says — an image that ships is never built on a machine
+every pull request's jobs have run on. Those jobs need Docker on the runner;
+see [Docker for image checks](#docker-for-image-checks).
 
 **Org-wide: the `DATUM_RUNNER_OFFLINE` variable.** While it is `"true"`, every
 opted-in job goes back to `ubuntu-latest`, whatever the input says:

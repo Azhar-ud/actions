@@ -49,6 +49,7 @@ Set `gate-on: CRITICAL` once the real number is known. Same phase-in as §11 cov
 | `platforms` | *(empty)* | e.g. `linux/amd64,linux/arm64`. Each architecture builds **natively**, arm64 on GitHub's `ubuntu-24.04-arm`; `build-scan` SBOMs and scans every platform, and `gate-on` applies to each, before `publish` pushes them; see [`platforms`](#platforms) |
 | `latest` | `true` | also move `latest` to this build, pushed after the SHA and version tags. Set `false` for a registry with tag immutability (Artifact Registry), which refuses to move it |
 | `also-registry` | *(empty)* | a second registry, reached by Workload Identity, that gets **the same scanned image** under the SHA and version, never `latest`. One build for both; see [`also-registry`](#also-registry) |
+| `runner-label` | `ubuntu-latest` | where `lint` and the amd64 `build-scan` leg run. **Ignored when `publish` is true.** `publish` and the arm64 leg never move; see [`runner-label`](#runner-label) |
 
 `publish` defaults to false deliberately. A pull request from a fork must not be able to push an image.
 
@@ -102,6 +103,24 @@ For an image that has to be in two registries — GHCR for Proxmox and Artifact 
 **The primary registry goes first, on its own.** It is signed in to and pushed before the second registry is touched, so a second-registry failure — its Workload Identity sign-in included — leaves the primary fully tagged and fails the job. When these were two jobs, a registry-0 failure left GHCR, which Proxmox pulls, published; one job keeps that. Re-run the failed job to complete the second.
 
 **The scanned archives are kept three days and dropped as soon as publish succeeds.** They are gigabytes per release, and Actions storage is billed by the hour against the same budget as the minutes. Three days lets a failed publish be re-run across a weekend. Dropping them needs `actions: write` on the calling job; without it publish says so and the archives expire on their own.
+
+### `runner-label`
+
+```yaml
+with:
+  publish: false
+  runner-label: datum
+```
+
+For a pull request's image checks. In polaris they were most of the paid minutes left after releases stopped rebuilding unchanged images, and they hold no credential, so they can run on the self-hosted runner like the rest of a pull request's CI.
+
+**Only the jobs with no credential move.** `lint` and the amd64 `build-scan` leg go to `runner-label`. `publish`, which signs in to the registries, always runs on `ubuntu-latest`, and the arm64 leg always runs on `ubuntu-24.04-arm`, because there is no arm64 self-hosted runner.
+
+**A run that publishes ignores it.** With `publish: true` every job stays on GitHub-hosted runners, whatever `runner-label` says. An image that ships is built and scanned on a fresh VM, never on a machine that every pull request's jobs have also run on, where one of them could have left something in the build cache for the next.
+
+**The org kill switch applies as everywhere else.** While `DATUM_RUNNER_OFFLINE` is `"true"`, both jobs go back to `ubuntu-latest`.
+
+**What the runner needs.** Docker in **rootless** mode, never the `docker` group: membership of that group is root on the machine, for every job. The daemon must run the containerd image store (the default for a new Docker 29 install), because the self-hosted leg builds with the daemon's own builder, and that builder can only write the OCI archive the scan reads with that store. The docker-container builder used on GitHub-hosted runners needs a privileged BuildKit container, which rootless Docker cannot fully grant. QEMU needs root to register, so a `platforms` value that would need it fails the leg at once, saying so. Setup is in [`self-hosted-runners.md`](self-hosted-runners.md#docker-for-image-checks).
 
 ## The hadolint config
 

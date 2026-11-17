@@ -126,9 +126,17 @@ for phrase, why in [
 ]:
     check(f"the runbook states: {phrase}", phrase in doc, why)
 
-check("the runbook says container builds stay off this box",
-      "Container jobs stay on GitHub-hosted" in doc,
-      "100 GB and image layers do not coexist")
+# Image checks run here now; what ships still does not, and the three
+# conditions that made the first safe have to stay written down.
+check("the runbook says publishing stays off this box",
+      "Publishing stays on GitHub-hosted" in doc,
+      "what ships is built on a machine no pull request has run on")
+check("the runbook says Docker here is rootless",
+      "**Rootless, never the `docker` group.**" in doc,
+      "the docker group is root on the machine, for every job")
+check("the runbook says image layers get their own disk",
+      "**Its own disk.**" in doc,
+      "100 GB and image layers do not coexist on the root disk")
 
 # --- credentials ----------------------------------------------------------
 apptok = code_only((R / "app-token.py").read_text())
