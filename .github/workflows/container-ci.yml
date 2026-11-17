@@ -140,6 +140,20 @@ on:
           meaning on such a registry anyway.
         type: boolean
         default: true
+      runner-label:
+        description: >-
+          Runner for the two jobs that hold no credential: `lint` and the amd64
+          `build-scan` leg. Leave it at the default and every job runs on
+          GitHub-hosted runners, exactly as before. Set it to a self-hosted
+          label (datumlabsio uses "datum") only for a repo whose runner group
+          grants that runner, and only where that runner has rootless Docker
+          with the containerd image store; see docs/self-hosted-runners.md.
+          IGNORED WHEN `publish` IS TRUE: an image that ships is built and
+          scanned on a fresh GitHub-hosted runner, never on a machine every
+          pull request's jobs have also run on. `publish` and the arm64 leg
+          never move.
+        type: string
+        default: "ubuntu-latest"
 
 # Deliberately no `permissions:` block at the top: publish takes what the caller
 # grants (packages or id-token write); declaring id-token would break every caller.
@@ -147,7 +161,9 @@ on:
 jobs:
   lint:
     if: ${{ inputs.hadolint }}
-    runs-on: ubuntu-latest
+    # The org kill switch, plus one condition of this workflow's own: a run
+    # that publishes never leaves GitHub-hosted runners (see runner-label).
+    runs-on: ${{ (inputs.publish || vars.DATUM_RUNNER_OFFLINE == 'true') && 'ubuntu-latest' || inputs.runner-label }}
     permissions:
       contents: read
     defaults:
@@ -177,10 +193,14 @@ jobs:
             exit 1
           fi
           v=$(grep '^hadolint=' "$p" | cut -d= -f2)
-          curl -sSL --fail -o /tmp/hadolint \
+          # The job's own temp, not /tmp: on a self-hosted runner a binary left
+          # where the next job looks is the isolation the ephemeral runner
+          # exists to provide, quietly gone.
+          hadolint="$RUNNER_TEMP/hadolint"
+          curl -sSL --fail -o "$hadolint" \
             "https://github.com/hadolint/hadolint/releases/download/v${v}/hadolint-linux-x86_64"
-          chmod +x /tmp/hadolint
-          /tmp/hadolint --version
+          chmod +x "$hadolint"
+          "$hadolint" --version
 
           # The org's shared rule set, from the repo's OWN copy — same
           # vendoring as container-tool-versions.txt above, so a developer
@@ -193,9 +213,9 @@ jobs:
           cfg="$CONFIG_DIR/hadolint.yaml"
           if [ -f "$cfg" ]; then
             echo "Using $cfg"
-            /tmp/hadolint --config "$cfg" "$DOCKERFILE"
+            "$hadolint" --config "$cfg" "$DOCKERFILE"
           else
-            /tmp/hadolint "$DOCKERFILE"
+            "$hadolint" "$DOCKERFILE"
           fi
           echo "Dockerfile is clean."
 
@@ -219,7 +239,10 @@ jobs:
     strategy:
       matrix:
         arch: ${{ fromJSON(inputs.platforms == 'linux/arm64' && '["arm64"]' || (contains(inputs.platforms, 'linux/arm64') && '["amd64","arm64"]' || '["amd64"]')) }}
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # arm64 always on GitHub's arm64 runners: there is no arm64 self-hosted
+    # runner. amd64 the same way lint does it -- runner-label, unless the org
+    # kill switch is on or this run publishes.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || ((inputs.publish || vars.DATUM_RUNNER_OFFLINE == 'true') && 'ubuntu-latest' || inputs.runner-label) }}
     permissions:
       contents: read
     defaults:
@@ -274,6 +297,13 @@ jobs:
           for p in "${mine[@]}"; do
             case "$ARCH:$p" in amd64:linux/amd64|arm64:linux/arm64*) ;; *) qemu=true ;; esac
           done
+          # A self-hosted runner's Docker is rootless, and registering QEMU's
+          # binfmt handlers takes root on the host. Say so here, rather than
+          # let the build die later on an exec format error.
+          if [ "$qemu" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = self-hosted ]; then
+            echo "::error::${mine[*]} needs QEMU, which a self-hosted runner does not offer. Drop runner-label for this call."
+            exit 1
+          fi
           (IFS=,; echo "list=${mine[*]}") >> "$GITHUB_OUTPUT"
           echo "qemu=$qemu" >> "$GITHUB_OUTPUT"
           echo "This leg builds ${mine[*]} on $(uname -m)$( [ "$qemu" = true ] && echo ', some under QEMU' )."
@@ -283,9 +313,19 @@ jobs:
         env:
           RUNNER_TOOL_CACHE: ${{ runner.temp }}
 
-      # Every leg, not only with `platforms`: the docker-container builder is
-      # what can export an OCI archive, and the archive is what gets scanned.
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Every GitHub-hosted leg, not only with `platforms`: there, the
+      # docker-container builder is what can export an OCI archive, and the
+      # archive is what gets scanned.
+      #
+      # A self-hosted leg skips it and builds with its daemon's own builder.
+      # That Docker is rootless -- the docker group would make every job root
+      # on the machine -- and the docker-container builder needs a privileged
+      # BuildKit container, which rootless Docker cannot fully grant. The
+      # daemon's builder exports OCI too, because the runner's Docker runs the
+      # containerd image store (docs/self-hosted-runners.md); without it the
+      # Build step fails naming exactly that.
+      - if: ${{ runner.environment != 'self-hosted' }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         env:
           RUNNER_TOOL_CACHE: ${{ runner.temp }}
 
@@ -442,7 +482,7 @@ jobs:
             fi
             # Which platforms this leg scanned, and on what, so "every
             # platform publish pushes was scanned" can be read off the run.
-            echo "| Scanned platforms | ${LIST:-none} on $(uname -m) |"
+            echo "| Scanned platforms | ${LIST:-none} on $(uname -m), ${RUNNER_ENVIRONMENT:-unknown runner} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -n "$notes" ]; then
